@@ -323,6 +323,21 @@
   min-height: 0; /* 允许内部滚动区域正确缩放 */
 }
 
+.ragScopeRow {
+  display: flex;
+  gap: 8px;
+}
+
+.ragScopeSelect {
+  flex: 1;
+  border-radius: 10px;
+  padding: 6px 10px;
+  border: 1px solid rgba(0,0,0,0.08);
+  outline: none;
+  font-size: 13px;
+  background: #fff;
+}
+
 .ragTextarea {
   width: 100%;
   min-height: 64px;

@@ -4,14 +4,18 @@ import jakarta.validation.constraints.NotBlank;
 
 /**
  * RAG 流式问答请求体。
- * sessionId 为空时自动创建新会话。
  */
 public record QaStreamRequest(
         @NotBlank String question,
         String sessionId,
+        String scope,
         int topK,
         int maxTokens
 ) {
+    public String scope() {
+        return scope != null && !scope.isBlank() ? scope : "single";
+    }
+
     public int topK() {
         return topK > 0 ? topK : 5;
     }

@@ -40,7 +40,7 @@ public class KnowPostRagController {
                                  @AuthenticationPrincipal Jwt jwt) {
         String userId = extractUserId(jwt);
         return ragQueryService.streamAnswerFlux(id, req.question(),
-                userId, req.sessionId(), req.topK(), req.maxTokens());
+                userId, req.sessionId(), req.scope(), req.topK(), req.maxTokens());
     }
 
     /**

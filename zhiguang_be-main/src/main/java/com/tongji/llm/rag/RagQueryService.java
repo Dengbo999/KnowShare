@@ -13,6 +13,8 @@ import org.springframework.ai.deepseek.DeepSeekChatOptions;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.ai.vectorstore.filter.Filter;
+import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
@@ -78,21 +80,23 @@ public class RagQueryService {
      * @param userId    用户 ID，为 null 时退化为无状态模式（不持久化）
      * @param sessionId 会话 ID，为 null 或空时创建新会话
      */
+    /**
+     * @param scope 检索范围："single" 单篇 | "user" 用户全部知文
+     */
     public Flux<String> streamAnswerFlux(long postId, String question,
                                           String userId, String sessionId,
-                                          int topK, int maxTokens) {
+                                          String scope, int topK, int maxTokens) {
         String pid = String.valueOf(postId);
 
-        // 匿名用户：无状态模式，不读不写 Redis
         if (userId == null || userId.isBlank()) {
-            return streamWithHistory(postId, question, null, topK, maxTokens);
+            return streamWithHistory(postId, question, scope, null, null, topK, maxTokens);
         }
 
         String sid = (sessionId != null && !sessionId.isBlank())
                 ? sessionId : conversationStore.create(pid, userId);
 
         List<ChatMessage> history = conversationStore.load(pid, userId, sid);
-        Flux<String> stream = streamWithHistory(postId, question, history, topK, maxTokens);
+        Flux<String> stream = streamWithHistory(postId, question, scope, userId, history, topK, maxTokens);
 
         StringBuilder fullAnswer = new StringBuilder();
         return stream
@@ -103,23 +107,25 @@ public class RagQueryService {
                 .doOnError(e -> log.warn("Stream error for session {}: {}", sid, e.getMessage()));
     }
 
-    /** 无会话的简化入口（兼容旧 GET 接口，不持久化历史）。 */
+    /** 无会话的简化入口（兼容旧 GET 接口）。 */
     public Flux<String> streamAnswerFlux(long postId, String question, int topK, int maxTokens) {
-        return streamWithHistory(postId, question, null, topK, maxTokens);
+        return streamWithHistory(postId, question, "single", null, null, topK, maxTokens);
     }
 
     /** 带历史的简化入口（兼容旧调用）。 */
     public Flux<String> streamAnswerFlux(long postId, String question,
                                           List<ChatMessage> history, int topK, int maxTokens) {
-        return streamWithHistory(postId, question, history, topK, maxTokens);
+        return streamWithHistory(postId, question, "single", null, history, topK, maxTokens);
     }
 
-    /** 核心流式逻辑：检索 + 组装 prompt + 调用 LLM。 */
-    private Flux<String> streamWithHistory(long postId, String question,
-                                            List<ChatMessage> history, int topK, int maxTokens) {
+    /** 核心流式逻辑。 */
+    private Flux<String> streamWithHistory(long postId, String question, String scope,
+                                            String userId, List<ChatMessage> history,
+                                            int topK, int maxTokens) {
         indexService.ensureIndexed(postId);
 
-        List<String> contexts = searchContexts(String.valueOf(postId), question, Math.max(1, topK));
+        List<String> contexts = searchContexts(String.valueOf(postId), userId,
+                question, scope, Math.max(1, topK));
         String context = String.join("\n\n---\n\n", contexts);
 
         String system = "你是中文知识助手。只能依据提供的上下文回答；无法确定时明确说不确定。";
@@ -179,15 +185,19 @@ public class RagQueryService {
     //  混合检索
     // ═══════════════════════════════════════════════
 
-    private List<String> searchContexts(String postId, String query, int topK) {
+    private List<String> searchContexts(String postId, String userId,
+                                         String query, String scope, int topK) {
         int fetchK = Math.max(topK * FETCH_MULTIPLIER, MIN_FETCH_K);
+
+        // 根据 scope 构建 ES 侧 filter（"single" → postId, "user" → creatorId）
+        Filter.Expression filter = buildFilter(scope, postId, userId);
 
         RewrittenQuery rewritten = queryRewriter.rewrite(chatClient, query);
         String vectorQuery = rewritten.hypotheticalAnswer() != null ? rewritten.hypotheticalAnswer() : query;
         String keywordQuery = rewritten.searchQuery() != null ? rewritten.searchQuery() : query;
 
-        List<RetrievalHit> vectorHits = vectorSearch(postId, vectorQuery, fetchK);
-        List<RetrievalHit> keywordHits = keywordSearch(postId, keywordQuery, fetchK);
+        List<RetrievalHit> vectorHits = vectorSearch(filter, vectorQuery, fetchK);
+        List<RetrievalHit> keywordHits = keywordSearch(filter, keywordQuery, fetchK);
         List<RetrievalHit> fusedHits = fuseByRrf(vectorHits, keywordHits);
 
         List<RetrievalHit> reranked = fusedHits;
@@ -204,18 +214,32 @@ public class RagQueryService {
         return contexts;
     }
 
-    private List<RetrievalHit> vectorSearch(String postId, String query, int fetchK) {
-        List<Document> docs = vectorStore.similaritySearch(
-                SearchRequest.builder().query(query).topK(fetchK).build()
-        );
+    /** 根据 scope 构建 ES filter。"single" → postId, "user" → creatorId。 */
+    private Filter.Expression buildFilter(String scope, String postId, String userId) {
+        if (!StringUtils.hasText(scope) || !StringUtils.hasText(postId)) return null;
+        FilterExpressionBuilder b = new FilterExpressionBuilder();
+        if ("user".equals(scope) && StringUtils.hasText(userId)) {
+            return b.eq("creatorId", userId).build();
+        }
+        if ("single".equals(scope)) {
+            return b.eq("postId", postId).build();
+        }
+        return null;
+    }
+
+    private List<RetrievalHit> vectorSearch(Filter.Expression filter, String query, int fetchK) {
+        SearchRequest.Builder builder = SearchRequest.builder().query(query).topK(fetchK);
+        if (filter != null) {
+            builder = builder.filterExpression(filter);
+        }
+        List<Document> docs = vectorStore.similaritySearch(builder.build());
         if (docs == null || docs.isEmpty()) return List.of();
 
         List<RetrievalHit> hits = new ArrayList<>(docs.size());
         for (Document doc : docs) {
-            Map<String, Object> metadata = doc.getMetadata() == null ? Collections.emptyMap() : doc.getMetadata();
-            if (!postId.equals(asString(metadata.get("postId")))) continue;
             String text = doc.getText();
             if (!StringUtils.hasText(text)) continue;
+            Map<String, Object> metadata = doc.getMetadata() == null ? Collections.emptyMap() : doc.getMetadata();
             String chunkId = firstNonBlank(asString(metadata.get("chunkId")), doc.getId());
             int position = asInt(metadata.get("position"), Integer.MAX_VALUE);
             hits.add(new RetrievalHit(firstNonBlank(chunkId, UUID.randomUUID().toString()), position, text));
@@ -224,23 +248,21 @@ public class RagQueryService {
     }
 
     @SuppressWarnings("unchecked")
-    private List<RetrievalHit> keywordSearch(String postId, String query, int fetchK) {
+    private List<RetrievalHit> keywordSearch(Filter.Expression filter, String query, int fetchK) {
         if (!StringUtils.hasText(esProperties.getIndex())) return List.of();
         try {
-            SearchResponse<Map<String, Object>> resp = es.search(s -> s
-                    .index(esProperties.getIndex())
-                    .size(fetchK)
-                    .query(q -> q.bool(b -> b
-                            .must(m -> m.match(mm -> mm.field("content").query(query)))
-                            .filter(f -> f.bool(fb -> fb
-                                    .should(sh -> sh.term(t -> t.field("metadata.postId.keyword")
-                                            .value(v -> v.stringValue(postId))))
-                                    .should(sh -> sh.term(t -> t.field("metadata.postId")
-                                            .value(v -> v.stringValue(postId))))
-                                    .minimumShouldMatch("1"))
-                            ))),
-                    (Class<Map<String, Object>>) (Class<?>) Map.class
-            );
+            SearchResponse<Map<String, Object>> resp = es.search(s -> {
+                var b = s.index(esProperties.getIndex()).size(fetchK)
+                        .query(q -> q.bool(bq -> {
+                            bq.must(m -> m.match(mm -> mm.field("content").query(query)));
+                            // 从 Filter.Expression 提取 ES 过滤条件
+                            if (filter != null) {
+                                applyEsFilter(bq, filter);
+                            }
+                            return bq;
+                        }));
+                return b;
+            }, (Class<Map<String, Object>>) (Class<?>) Map.class);
             List<Hit<Map<String, Object>>> esHits = resp.hits() == null ? List.of() : resp.hits().hits();
             if (esHits == null || esHits.isEmpty()) return List.of();
 
@@ -250,16 +272,33 @@ public class RagQueryService {
                 if (source == null || source.isEmpty()) continue;
                 String text = asString(source.get("content"));
                 if (!StringUtils.hasText(text)) continue;
-                Map<String, Object> metadata = asMap(source.get("metadata"));
-                if (!postId.equals(asString(metadata.get("postId")))) continue;
-                String chunkId = firstNonBlank(asString(metadata.get("chunkId")), hit.id());
-                int position = asInt(metadata.get("position"), Integer.MAX_VALUE);
-                hits.add(new RetrievalHit(firstNonBlank(chunkId, UUID.randomUUID().toString()), position, text));
+                String chunkId = firstNonBlank(asString(source.get("chunkId")),
+                        asString(source.get("_id")));
+                hits.add(new RetrievalHit(firstNonBlank(chunkId, UUID.randomUUID().toString()), 0, text));
             }
             return hits;
         } catch (Exception e) {
             log.warn("Keyword retrieval failed, fallback to vector only: {}", e.getMessage());
             return List.of();
+        }
+    }
+
+    /** 将 Filter.Expression 转为 ES bool filter 条件。 */
+    private void applyEsFilter(
+            co.elastic.clients.elasticsearch._types.query_dsl.BoolQuery.Builder bq,
+            Filter.Expression filter) {
+        // 简化：只处理 eq("field", "value") 的情况
+        if (filter.type() == Filter.ExpressionType.EQ
+                && filter.left() instanceof Filter.Key k
+                && filter.right() instanceof Filter.Value v) {
+            String field = "metadata." + k.key();
+            String value = String.valueOf(v.value());
+            bq.filter(f -> f.bool(fb -> fb
+                    .should(sh -> sh.term(t -> t.field(field + ".keyword")
+                            .value(tv -> tv.stringValue(value))))
+                    .should(sh -> sh.term(t -> t.field(field)
+                            .value(tv -> tv.stringValue(value))))
+                    .minimumShouldMatch("1")));
         }
     }
 

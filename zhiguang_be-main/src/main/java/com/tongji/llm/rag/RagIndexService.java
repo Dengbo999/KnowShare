@@ -90,6 +90,7 @@ public class RagIndexService {
             String cid = postId + "#" + i;
             Map<String, Object> meta = new HashMap<>();
             meta.put("postId", String.valueOf(postId));
+            meta.put("creatorId", String.valueOf(row.getCreatorId()));
             meta.put("chunkId", cid);
             meta.put("position", i);
             meta.put("sectionTitle", c.sectionTitle());

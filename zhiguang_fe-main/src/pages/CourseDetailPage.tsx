@@ -43,6 +43,7 @@ const CourseDetailPage = () => {
   const [ragLoading, setRagLoading] = useState<boolean>(false);
   const [ragError, setRagError] = useState<string | null>(null);
   const ragAbortRef = useRef<AbortController | null>(null);
+  const [ragScope, setRagScope] = useState<"single" | "user">("single");
   const [ragTopK, setRagTopK] = useState<number>(5);
   const [ragMaxTokens, setRagMaxTokens] = useState<number>(1024);
   // 从头像 URL 推断作者 ID（示例：.../avatars/3-xxxx.jpg → 3）
@@ -191,6 +192,7 @@ const CourseDetailPage = () => {
         body: JSON.stringify({
           question: q,
           sessionId: sid,
+          scope: ragScope,
           topK: ragTopK,
           maxTokens: ragMaxTokens,
         }),
@@ -393,6 +395,17 @@ const CourseDetailPage = () => {
                   }
                 }}
               />
+              <div className={styles.ragScopeRow}>
+                <select
+                  className={styles.ragScopeSelect}
+                  value={ragScope}
+                  onChange={(e) => setRagScope(e.target.value as “single” | “user”)}
+                  disabled={ragLoading}
+                >
+                  <option value=”single”>当前知文</option>
+                  <option value=”user”>我的知文</option>
+                </select>
+              </div>
               <div className={styles.ragControls}>
                 <button
                   type=”button”
