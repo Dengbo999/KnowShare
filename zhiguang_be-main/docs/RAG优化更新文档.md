@@ -182,9 +182,94 @@ TTL:   7 天（每次追加续期）
 
 ---
 
-## 六、完整文件清单
+## 六、ES 字段设计
 
-### 新增文件（10 个）
+项目有两套索引，用途不同。
+
+### 6.1 RAG 向量索引 — `zhiguang-ai-index`
+
+Spring AI VectorStore 自动管理 schema，`RagIndexService.reindexSinglePost()` 写入。
+
+**写入结构：**
+
+```java
+Document {
+    text: "这是切块后的正文内容...",   // → ES content 字段
+    metadata: {
+        postId:       "42",           // 知文 ID（Filter 用）
+        chunkId:      "42#3",         // 分块唯一标识（去重用）
+        position:     3,              // 原文顺序（RRF tie-break）
+        sectionTitle: "核心观点",      // 所属章节标题
+        creatorId:    "1001",         // 作者 ID（user scope filter 用）
+        contentEtag:  "abc123",       // 指纹（幂等去重）
+        contentSha256:"def456",       // 指纹（幂等去重）
+        contentUrl:   "https://...",  // 原文地址
+        title:        "知文标题"
+    }
+}
+```
+
+**ES 字段映射：**
+
+```
+zhiguang-ai-index
+├── content          (text)         ← chunk 正文，BM25 关键词检索
+├── embedding        (dense_vector, 1536) ← DashScope text-embedding-v4
+└── metadata         (object)
+    ├── postId       (keyword)      ← scope=single 时 filter: eq("postId", "42")
+    ├── creatorId    (keyword)      ← scope=user 时 filter: eq("creatorId", "1001")
+    ├── chunkId      (keyword)      ← RRF 去重主键
+    ├── position     (integer)      ← 原文顺序，RRF tie-break
+    ├── sectionTitle (text)         ← chunk 来源章节
+    ├── title        (text)         ← 知文标题
+    └── ...
+```
+
+### 6.2 搜索索引 — `zhiguang_content_index`
+
+文章全文搜索，`SearchIndexService.upsertKnowPost()` 写入。
+
+```
+zhiguang_content_index
+├── content_id       (keyword)      ← 知文 ID
+├── title            (text)         ← 标题，multi_match 权重 x3
+├── body             (text)         ← 正文，截断 4000 字符
+├── description      (text)         ← 摘要
+├── status           (keyword)      ← "published" filter
+├── tags             (keyword[])    ← 标签过滤
+├── publish_time     (long)         ← 排序字段
+├── like_count       (long)         ← function_score 加权
+├── view_count       (long)         ← function_score 加权
+├── author_id / author_avatar / author_nickname / author_tag_json
+└── title_suggest    (completion)   ← 搜索联想
+```
+
+### 6.3 检索对比
+
+| | 向量检索 | 关键词检索 | 全文搜索 |
+|---|---|---|---|
+| 索引 | `zhiguang-ai-index` | `zhiguang-ai-index` | `zhiguang_content_index` |
+| 字段 | `embedding` (kNN) | `content` (BM25 match) | `title^3` + `body` (multi_match) |
+| Filter | `filterExpression(...)` | ES term filter | term filter |
+| 排序 | 余弦相似度 | BM25 | BM25 + function_score |
+| 粒度 | chunk | chunk | 文章 |
+| 用途 | 语义相似 | 精确关键词 | 文章搜索 |
+
+### 6.4 检索流程中的 filter 构建
+
+```
+scope = "single" → filterExpression("postId == '42'")
+scope = "user"   → filterExpression("creatorId == '1001'")
+scope = null     → 无 filter（匿名退化为无状态）
+```
+
+向量检索用 Spring AI `filterExpression()` 在 ES 侧过滤，关键词检索在 ES DSL 中加 `must`/`filter` 子句。都在 ES 侧完成，不再 Java 后过滤。
+
+---
+
+## 七、完整文件清单
+
+### 新增文件（16 个）
 
 ```
 src/main/java/com/tongji/llm/rag/
@@ -232,7 +317,7 @@ JUnit 测试: 30 用例，全部通过 ✅
 
 ---
 
-## 七、待优化项
+## 八、待优化项
 
 | 优化项 | 优先级 | 说明 |
 |--------|:--:|------|
@@ -243,7 +328,7 @@ JUnit 测试: 30 用例，全部通过 ✅
 
 ---
 
-## 八、部署注意
+## 九、部署注意
 
 1. **DashScope Rerank API**：需在阿里云百炼控制台开通 `gte-rerank-v2` 模型，API Key 复用现有 `spring.ai.openai.api-key`
 2. **Redis**：需确保 `192.168.183.100:6379` 可用，会话 key 自动 7 天过期
