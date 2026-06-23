@@ -35,9 +35,15 @@ const CourseDetailPage = () => {
   // RAG 问答状态
   const [ragQuestion, setRagQuestion] = useState<string>("");
   const [ragAnswer, setRagAnswer] = useState<string>("");
+  const [ragHistory, setRagHistory] = useState<{role: string, content: string}[]>([]);
+  const [ragSessionId, setRagSessionId] = useState<string>(() => {
+    // 从 localStorage 恢复该文章的会话 ID
+    return id ? localStorage.getItem(`rag_session_${id}`) || "" : "";
+  });
   const [ragLoading, setRagLoading] = useState<boolean>(false);
   const [ragError, setRagError] = useState<string | null>(null);
-  const ragESRef = useRef<EventSource | null>(null);
+  const ragAbortRef = useRef<AbortController | null>(null);
+  const [ragScope, setRagScope] = useState<"single" | "user">("single");
   const [ragTopK, setRagTopK] = useState<number>(5);
   const [ragMaxTokens, setRagMaxTokens] = useState<number>(1024);
   // 从头像 URL 推断作者 ID（示例：.../avatars/3-xxxx.jpg → 3）
@@ -143,51 +149,104 @@ const CourseDetailPage = () => {
     setPreviewIndex((i) => (i + 1) % detail.images.length);
   };
 
-  // 启动 RAG 流式问答
-  const startRag = () => {
+  // 启动 RAG 流式问答（Redis 会话模式）
+  const startRag = async () => {
     if (!id) return;
     const q = ragQuestion.trim();
     if (!q) return;
-    if (detail && detail.visible !== "public") {
-      setRagError("仅公开知文支持问答");
+    if (detail && detail.visible !== “public”) {
+      setRagError(“仅公开知文支持问答”);
       return;
     }
     setRagError(null);
-    setRagAnswer("");
-    // 关闭之前的连接
-    if (ragESRef.current) {
-      try { ragESRef.current.close(); } catch {}
-      ragESRef.current = null;
+    setRagAnswer(“”);
+    if (ragAbortRef.current) {
+      try { ragAbortRef.current.abort(); } catch {}
+      ragAbortRef.current = null;
     }
-    const url = `/api/v1/knowposts/${id}/qa/stream?question=${encodeURIComponent(q)}&topK=${ragTopK}&maxTokens=${ragMaxTokens}`;
-    const es = new EventSource(url);
-    ragESRef.current = es;
+    const controller = new AbortController();
+    ragAbortRef.current = controller;
     setRagLoading(true);
-    es.onmessage = (e) => {
-      setRagAnswer((prev) => prev + (e.data ?? ""));
-    };
-    es.onerror = () => {
+
+    // 确保有 sessionId（无则创建新会话）
+    let sid = ragSessionId;
+    if (!sid) {
+      try {
+        const res = await fetch(`/api/v1/knowposts/${id}/qa/sessions`, { method: “POST” });
+        const data = await res.json();
+        sid = data.sessionId;
+        setRagSessionId(sid);
+        localStorage.setItem(`rag_session_${id}`, sid);
+      } catch {
+        setRagError(“创建会话失败”);
+        setRagLoading(false);
+        return;
+      }
+    }
+
+    try {
+      const url = `/api/v1/knowposts/${id}/qa/stream`;
+      const resp = await fetch(url, {
+        method: “POST”,
+        headers: { “Content-Type”: “application/json” },
+        body: JSON.stringify({
+          question: q,
+          sessionId: sid,
+          scope: ragScope,
+          topK: ragTopK,
+          maxTokens: ragMaxTokens,
+        }),
+        signal: controller.signal,
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const reader = resp.body?.getReader();
+      if (!reader) throw new Error(“No response body”);
+      const decoder = new TextDecoder();
+      let full = “”;
+      let buffer = “”;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split(“\n”);
+        buffer = lines.pop() || “”;
+        for (const line of lines) {
+          if (line.startsWith(“data:”)) {
+            full += line.slice(5).trim();
+          }
+        }
+        setRagAnswer(full);
+      }
+      // 更新本地历史展示
+      setRagHistory((prev) => [
+        ...prev,
+        { role: “user”, content: q },
+        { role: “assistant”, content: full || “(空回答)” },
+      ]);
+      setRagQuestion(“”);
+    } catch (err: any) {
+      if (err.name !== “AbortError”) {
+        // 静默
+      }
+    } finally {
       setRagLoading(false);
-      // 不展示“连接中断或后端异常”，静默关闭连接
-      try { es.close(); } catch {}
-      ragESRef.current = null;
-    };
+      ragAbortRef.current = null;
+    }
   };
 
   const stopRag = () => {
-    if (ragESRef.current) {
-      try { ragESRef.current.close(); } catch {}
-      ragESRef.current = null;
+    if (ragAbortRef.current) {
+      try { ragAbortRef.current.abort(); } catch {}
+      ragAbortRef.current = null;
     }
     setRagLoading(false);
   };
 
   useEffect(() => {
     return () => {
-      // 页面卸载时关闭 SSE
-      if (ragESRef.current) {
-        try { ragESRef.current.close(); } catch {}
-        ragESRef.current = null;
+      if (ragAbortRef.current) {
+        try { ragAbortRef.current.abort(); } catch {}
+        ragAbortRef.current = null;
       }
     };
   }, []);
@@ -287,52 +346,87 @@ const CourseDetailPage = () => {
 
           <aside className={styles.ragPanel}>
             <div className={styles.ragBody}>
+              {/* 对话历史 */}
+              <div className={styles.ragHistory}>
+                {ragHistory.map((msg, i) => (
+                  <div key={i} className={msg.role === “user” ? styles.ragMsgUser : styles.ragMsgAssistant}>
+                    <div className={styles.ragMsgLabel}>{msg.role === “user” ? “你” : “AI”}</div>
+                    <div className={`${styles.markdown} ${styles.ragMsgContent}`}>
+                      <ReactMarkdown
+                        remarkPlugins={[remarkGfm]}
+                        components={{
+                          a: ({ node, ...props }) => <a {...props} target=”_blank” rel=”noreferrer” />,
+                        }}
+                      >
+                        {msg.content}
+                      </ReactMarkdown>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              {/* 当前回答（流式） */}
+              {ragLoading && (
+                <div className={styles.ragMsgAssistant}>
+                  <div className={styles.ragMsgLabel}>AI</div>
+                  <div className={`${styles.markdown} ${styles.ragMsgContent}`}>
+                    {ragAnswer ? (
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                        {ragAnswer}
+                      </ReactMarkdown>
+                    ) : (
+                      <span style={{ color: “var(--color-text-muted)” }}>思考中…</span>
+                    )}
+                  </div>
+                </div>
+              )}
+              {ragError ? (
+                <div style={{ color: “var(--color-danger)” }}>{ragError}</div>
+              ) : null}
+              {/* 输入区 */}
               <textarea
                 className={styles.ragTextarea}
-                placeholder="围绕本知文提问，例如：这篇知文的核心观点是什么？"
+                placeholder=”围绕本知文提问，例如：这篇知文的核心观点是什么？”
                 value={ragQuestion}
                 onChange={(e) => setRagQuestion(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === “Enter” && !e.shiftKey) {
+                    e.preventDefault();
+                    startRag();
+                  }
+                }}
               />
+              <div className={styles.ragScopeRow}>
+                <select
+                  className={styles.ragScopeSelect}
+                  value={ragScope}
+                  onChange={(e) => setRagScope(e.target.value as “single” | “user”)}
+                  disabled={ragLoading}
+                >
+                  <option value=”single”>当前知文</option>
+                  <option value=”user”>我的知文</option>
+                </select>
+              </div>
               <div className={styles.ragControls}>
                 <button
-                  type="button"
+                  type=”button”
                   className={`${styles.ragBtn} ${styles.ragBtnPrimary}`}
                   onClick={startRag}
                   disabled={ragLoading || !ragQuestion.trim()}
                 >
-                  {ragLoading ? "生成中…" : "发送"}
+                  {ragLoading ? “生成中…” : “发送”}
                 </button>
-                <button type="button" className={`${styles.ragBtn} ${styles.ragBtnGhost}`} onClick={stopRag} disabled={!ragLoading}>
+                <button type=”button” className={`${styles.ragBtn} ${styles.ragBtnGhost}`} onClick={stopRag} disabled={!ragLoading}>
                   停止
                 </button>
-              </div>
-              <div className={styles.ragHint}>
-                说明：仅“公开”知文支持问答，答案基于当前知文的索引片段实时生成。
-              </div>
-              {ragError ? (
-                <div style={{ color: "var(--color-danger)" }}>{ragError}</div>
-              ) : null}
-              <div className={styles.ragAnswer}>
-                {ragAnswer ? (
-                  <div className={styles.markdown}>
-                    <ReactMarkdown
-                      remarkPlugins={[remarkGfm]}
-                      components={{
-                        a: ({ node, ...props }) => (
-                          <a {...props} target="_blank" rel="noreferrer" />
-                        ),
-                        img: ({ node, ...props }) => (
-                          <img {...props} style={{ maxWidth: "100%", borderRadius: 12 }} />
-                        ),
-                      }}
-                    >
-                      {ragAnswer}
-                    </ReactMarkdown>
-                  </div>
-                ) : (
-                  <div className={styles.ragPlaceholder}>
-                    {ragLoading ? "等待生成…" : "这里将展示答案（支持流式）"}
-                  </div>
+                {ragHistory.length > 0 && (
+                  <button type=”button” className={`${styles.ragBtn} ${styles.ragBtnGhost}`} onClick={() => {
+                    setRagSessionId(“”);
+                    setRagHistory([]);
+                    setRagAnswer(“”);
+                    if (id) localStorage.removeItem(`rag_session_${id}`);
+                  }}>
+                    新对话
+                  </button>
                 )}
               </div>
             </div>

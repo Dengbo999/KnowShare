@@ -230,6 +230,51 @@
 }
 
 /* RAG 问答侧栏 */
+/* 对话历史 */
+.ragHistory {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 4px 0;
+}
+
+.ragMsgUser,
+.ragMsgAssistant {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ragMsgUser .ragMsgContent {
+  align-self: flex-end;
+  background: var(--color-primary);
+  color: #fff;
+  border-radius: 16px 16px 4px 16px;
+  padding: 10px 14px;
+  max-width: 85%;
+}
+
+.ragMsgAssistant .ragMsgContent {
+  align-self: flex-start;
+  background: rgba(246, 248, 250, 0.95);
+  color: var(--color-text);
+  border-radius: 16px 16px 16px 4px;
+  padding: 10px 14px;
+  max-width: 85%;
+}
+
+.ragMsgContent p { margin: 0; }
+.ragMsgContent pre { font-size: 13px; }
+.ragMsgContent code { font-size: 13px; }
+
+.ragMsgLabel {
+  font-size: 12px;
+  color: var(--color-text-muted);
+  padding: 0 4px;
+}
+
 .ragToggle {
   display: inline-flex;
   align-items: center;
@@ -276,6 +321,21 @@
   gap: 10px;
   flex: 1;
   min-height: 0; /* 允许内部滚动区域正确缩放 */
+}
+
+.ragScopeRow {
+  display: flex;
+  gap: 8px;
+}
+
+.ragScopeSelect {
+  flex: 1;
+  border-radius: 10px;
+  padding: 6px 10px;
+  border: 1px solid rgba(0,0,0,0.08);
+  outline: none;
+  font-size: 13px;
+  background: #fff;
 }
 
 .ragTextarea {

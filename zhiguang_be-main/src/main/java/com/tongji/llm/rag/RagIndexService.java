@@ -77,24 +77,28 @@ public class RagIndexService {
             return 0;
         }
 
-        // 先按 Markdown 标题切段，再做固定长度切片（带重叠）
-        List<String> chunks = chunkMarkdown(text);
+        // 递归语义切分（6级），产生携带章节标题的有序片段
+        MarkdownChunker chunker = new MarkdownChunker();
+        List<Chunk> chunks = chunker.chunk(text, ChunkOptions.defaults());
         // 幂等 upsert：先删除旧切片
         deleteExistingChunks(postId);
 
         // 组装 Document（文本 + 业务元数据），用于向量写入与检索过滤
         List<Document> docs = new ArrayList<>(chunks.size());
         for (int i = 0; i < chunks.size(); i++) {
+            Chunk c = chunks.get(i);
             String cid = postId + "#" + i;
             Map<String, Object> meta = new HashMap<>();
             meta.put("postId", String.valueOf(postId));
+            meta.put("creatorId", String.valueOf(row.getCreatorId()));
             meta.put("chunkId", cid);
             meta.put("position", i);
+            meta.put("sectionTitle", c.sectionTitle());
             meta.put("contentEtag", currentEtag);
             meta.put("contentSha256", currentSha);
             meta.put("contentUrl", row.getContentUrl());
             meta.put("title", row.getTitle());
-            docs.add(new Document(chunks.get(i), meta));
+            docs.add(new Document(c.text(), meta));
         }
         try {
             // 批量写入向量库
@@ -177,47 +181,5 @@ public class RagIndexService {
             log.error("Fetch content failed: {}", e.getMessage());
             return null;
         }
-    }
-
-    /**
-     * 按 Markdown 标题切段，再交由固定长度切片策略处理。
-     */
-    private List<String> chunkMarkdown(String text) {
-        List<String> paras = new ArrayList<>();
-        String[] lines = text.split("\r?\n");
-        StringBuilder buf = new StringBuilder();
-        for (String line : lines) {
-            boolean isHeader = line.startsWith("#");
-            if (isHeader && !buf.isEmpty()) { // 遇到新的标题，收束上一段
-                paras.add(buf.toString());
-                buf.setLength(0);
-            }
-            buf.append(line).append('\n');
-        }
-        if (!buf.isEmpty()) paras.add(buf.toString());
-
-        return getChunks(paras);
-    }
-
-    /**
-     * 固定长度切片（每片 ≤ 800 字符），切片间 100 字符重叠：
-     * - 兼顾检索召回与上下文连续性
-     */
-    private static List<String> getChunks(List<String> paras) {
-        List<String> chunks = new ArrayList<>();
-        for (String p : paras) {
-            if (p.length() <= 800) {
-                chunks.add(p);
-            } else {
-                int start = 0;
-                while (start < p.length()) {
-                    int end = Math.min(start + 800, p.length());
-                    chunks.add(p.substring(start, end));
-                    if (end >= p.length()) break;
-                    start = Math.max(end - 100, start + 1); // 重叠 100 字符以保留语义连续
-                }
-            }
-        }
-        return chunks;
     }
 }
